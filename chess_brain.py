@@ -5,7 +5,7 @@ import redis
 
 logger = logging.getLogger(__name__)
 
-STOCKFISH_PATH = r"C:\Users\Iqra Jawad Ahmed\OneDrive\Desktop\shiza_tested\ifyp\stockfish\stockfish-windows-x86-64-avx2.exe"
+STOCKFISH_PATH = r"C:\Users\shiza\OneDrive\Desktop\sw_making\stockfish\stockfish-windows-x86-64-avx2.exe"
 
 # Redis connection 
 REDIS_HOST = "127.0.0.1"
@@ -105,7 +105,8 @@ def _keep_first_piece(rows: list, piece: str) -> list:
                     logger.info("[ChessBrain] Extra '%s' removed from FEN", piece)
             else:
                 new_row += ch
-        new_rows.append(new_row)
+        # Re-compress the row so adjacent empty squares (like '1' + '2') are correctly combined into '3'
+        new_rows.append(_compress_row(_expand_row(new_row)))
     return new_rows
 
 
@@ -267,6 +268,7 @@ class ChessBrain:
             "success":     True,
             "error":       None,
             "robot_move":  robot_move.uci(),
+            "new_fen":     board.fen(),
             "human_hints": human_hints,
             "difficulty":  difficulty,
         }

@@ -125,8 +125,9 @@ def process_frame(frame_input, frame_id=0, visualise: bool = True) -> dict:
         return _fail(f"Missing marker ID in cache: {e}. Re-calibrate.")
 
     # 3. Detect Pieces on ORIGINAL image
-    # Use a medium imgsz for balance between speed and accuracy
-    results = _MODEL.predict(img, conf=0.3, iou=0.45, imgsz=640, verbose=False)
+    # Lowered confidence to 0.15 to catch missing pieces (e.g. King/Bishops).
+    # False positives are handled by the square overriding logic.
+    results = _MODEL.predict(img, conf=0.15, iou=0.45, imgsz=640, verbose=False)
     boxes = results[0].boxes
     
     square_detections = {}
@@ -141,9 +142,21 @@ def process_frame(frame_input, frame_id=0, visualise: bool = True) -> dict:
             
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         
-        # We use the BOTTOM-CENTER of the box for piece placement (where it touches the board)
-        cx = (x1 + x2) / 2
-        cy = y2  # Pieces are vertical; the base is at the bottom of the box
+        h = y2 - y1
+        w = x2 - x1
+        
+        # The camera is at the top-center. Pieces lean towards it.
+        # This means the YOLO bounding box includes the top of the piece, 
+        # which shifts the box center INWARDS and UPWARDS compared to the true base.
+        
+        # 1. Move Y slightly up from the bottom edge to avoid shadows/loose boxes
+        cy = y2 - (h * 0.15)
+        
+        # 2. Push X OUTWARDS from the center to compensate for the piece leaning inwards
+        img_w = img.shape[1]
+        cx_box = (x1 + x2) / 2
+        outward_factor = (cx_box - (img_w / 2)) / (img_w / 2)  # -1.0 to 1.0
+        cx = cx_box + (outward_factor * w * 0.25)  # Push outward by up to 25% of width
         
         # Transform to board space
         pt = np.array([[[cx, cy]]], dtype=np.float32)
