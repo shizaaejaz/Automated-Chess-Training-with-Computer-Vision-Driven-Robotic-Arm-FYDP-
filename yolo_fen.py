@@ -31,9 +31,9 @@ MODEL_PATH = r"C:\Users\shiza\OneDrive\Desktop\fyp_sw_test\best_finetuned.pt"
 CACHE_FILE = "board_cache.json"
 BOARD_SIZE = 800          # Size of the warped board image (pixels)
 
-# MARGIN: The markers are on the board frame, not the exact corners of the a1-h8 grid.
-# Increase this if pieces are shifted to the right/left. 0.05 = 5% margin.
-BOARD_MARGIN = 0.04       
+# MARGIN: The markers# Adjust this until the 8x8 grid perfectly fills the 800x800 warped image.
+# 0.05 (5%) is a good balanced margin for this board setup.
+BOARD_MARGIN = 0.05       
 
 SQ_SIZE    = BOARD_SIZE // 8 
 
@@ -42,7 +42,7 @@ FEN_MAP = {
     "white_rook":   "R", "black_rook":   "r",
     "white_knight": "N", "black_knight": "n",
     "white_bishop": "B", "black_bishop": "b",
-    "white_queen":  "Q", "black_queen":  "q",
+    "white_queen":  "Q", "black_queen": "q",
     "white_king":   "K", "black_king":   "k",
 }
 
@@ -119,15 +119,26 @@ def process_frame(frame_input, frame_id=0, visualise: bool = True) -> dict:
             bl = bl * [scale_x, scale_y]
             
         src_pts = np.float32([tl, tr, br, bl])
-        dst_pts = np.float32([[0,0], [BOARD_SIZE,0], [BOARD_SIZE,BOARD_SIZE], [0,BOARD_SIZE]])
+        
+        # PERFECT 64 SQUARES: Zoom in so the grid fills the 800x800 view
+        # We map markers to a larger virtual area so the inner 8x8 grid 
+        # fits exactly into the 800x800 output.
+        total_v_size = BOARD_SIZE / (1 - 2 * BOARD_MARGIN)
+        offset = (total_v_size - BOARD_SIZE) / 2
+        
+        dst_pts = np.float32([
+            [-offset, -offset], 
+            [BOARD_SIZE + offset, -offset], 
+            [BOARD_SIZE + offset, BOARD_SIZE + offset], 
+            [-offset, BOARD_SIZE + offset]
+        ])
+        
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
     except KeyError as e:
         return _fail(f"Missing marker ID in cache: {e}. Re-calibrate.")
 
     # 3. Detect Pieces on ORIGINAL image
-    # Lowered confidence to 0.15 to catch missing pieces (e.g. King/Bishops).
-    # False positives are handled by the square overriding logic.
-    results = _MODEL.predict(img, conf=0.15, iou=0.45, imgsz=640, verbose=False)
+    results = _MODEL.predict(img, conf=0.15, iou=0.45, imgsz=1024, verbose=False)
     boxes = results[0].boxes
     
     square_detections = {}
@@ -142,43 +153,29 @@ def process_frame(frame_input, frame_id=0, visualise: bool = True) -> dict:
             
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         
-        h = y2 - y1
-        w = x2 - x1
+        # FIXED: Center of the piece base (slightly up from the absolute bottom)
+        h_px = y2 - y1
+        cx = (x1 + x2) / 2
+        # FIXED: Center of the piece base (15% up to avoid the very front edge)
+        cy = y2 - (h_px * 0.15)
         
-        # The camera is at the top-center. Pieces lean towards it.
-        # This means the YOLO bounding box includes the top of the piece, 
-        # which shifts the box center INWARDS and UPWARDS compared to the true base.
-        
-        # 1. Move Y slightly up from the bottom edge to avoid shadows/loose boxes
-        cy = y2 - (h * 0.15)
-        
-        # 2. Push X OUTWARDS from the center to compensate for the piece leaning inwards
-        img_w = img.shape[1]
-        cx_box = (x1 + x2) / 2
-        outward_factor = (cx_box - (img_w / 2)) / (img_w / 2)  # -1.0 to 1.0
-        cx = cx_box + (outward_factor * w * 0.25)  # Push outward by up to 25% of width
+        # INWARD SHIFT: Pull the point slightly towards the center of the board.
+        # This compensates for the camera's perspective lean.
+        img_h, img_w = img.shape[:2]
+        cx = cx + (img_w/2 - cx) * 0.05  # Pull 5% towards center X
+        cy = cy + (img_h/2 - cy) * 0.05  # Pull 5% towards center Y
         
         # Transform to board space
         pt = np.array([[[cx, cy]]], dtype=np.float32)
         pt_board = cv2.perspectiveTransform(pt, M)[0][0]
         bx, by = pt_board[0], pt_board[1]
         
-        # Check if inside board boundaries (with some overflow allowance)
-        # We allow -5% to 105% to catch pieces whose base is slightly outside markers
-        margin_px = BOARD_SIZE * 0.08
-        if -margin_px <= bx < BOARD_SIZE + margin_px and -margin_px <= by < BOARD_SIZE + margin_px:
+        # 3. Calculate mapping (Warped image is now exactly 8x8)
+        # Check if inside board boundaries [0, BOARD_SIZE]
+        if -20 <= bx < BOARD_SIZE + 20 and -20 <= by < BOARD_SIZE + 20:
             
-            # Map bx, by to square index [0-7] accounting for the BOARD_MARGIN
-            # The playable 8x8 area is within [margin, 1-margin] of the BOARD_SIZE
-            inner_w = BOARD_SIZE * (1 - 2 * BOARD_MARGIN)
-            inner_h = BOARD_SIZE * (1 - 2 * BOARD_MARGIN)
-            
-            # Calculate relative position inside the inner 8x8 grid
-            rel_x = (bx - BOARD_SIZE * BOARD_MARGIN) / inner_w
-            rel_y = (by - BOARD_SIZE * BOARD_MARGIN) / inner_h
-            
-            col = int(np.clip(rel_x * 8, 0, 7))
-            row = int(np.clip(rel_y * 8, 0, 7))
+            col = int(np.clip(bx // SQ_SIZE, 0, 7))
+            row = int(np.clip(by // SQ_SIZE, 0, 7))
             
             # Highest confidence wins the square
             if (row, col) not in square_detections or conf > square_detections[(row, col)]["conf"]:
@@ -248,14 +245,23 @@ def _visualise_results(img, M, detections, fen, frame_id):
     # Panel 2: Warped Top-Down
     axes[1].imshow(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
     axes[1].set_title("Step 2: Correct Perspective Warp")
-    # Draw Grid
+    
+    # Draw perfect 64 squares (filling the entire zoomed view)
     for i in range(9):
-        axes[1].axhline(i * SQ_SIZE, color='lime', alpha=0.3)
-        axes[1].axvline(i * SQ_SIZE, color='lime', alpha=0.3)
-    # Draw Piece Centers
+        pos = i * SQ_SIZE
+        # Horizontal lines
+        axes[1].plot([0, BOARD_SIZE], [pos, pos], color='lime', alpha=0.8, linewidth=1)
+        # Vertical lines
+        axes[1].plot([pos, pos], [0, BOARD_SIZE], color='lime', alpha=0.8, linewidth=1)
+        
+    # Draw Piece Centers (Snapped to the center of each cell for visual clarity)
     for (r, c), d in detections.items():
-        bx, by = d["board_pt"]
-        axes[1].plot(bx, by, 'yo', markersize=6)
+        # Plot the dot at the mathematical center of the detected square (c, r)
+        snap_x = (c + 0.5) * SQ_SIZE
+        snap_y = (r + 0.5) * SQ_SIZE
+        axes[1].plot(snap_x, snap_y, 'yo', markersize=8, markeredgecolor='black')
+        
+        # Piece label
         axes[1].text(c*SQ_SIZE + 5, r*SQ_SIZE + 20, d["char"], color='white', weight='bold')
     axes[1].axis('off')
 
