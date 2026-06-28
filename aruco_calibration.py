@@ -674,3 +674,453 @@ def print_next_step():
 
 if __name__ == "__main__":
     main()
+# """
+# aruco_calibration.py
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Chess Robot — Board Calibration Phase (Inner-Corner Alignment)
+
+# WHAT THIS DOES:
+#   1. Reads live frames from Redis.
+#   2. Detects ArUco markers with IDs: 10 (BL), 11 (BR), 12 (TL), 13 (TR).
+#   3. Uses the EXACT INNER CORNER of each marker instead of the center
+#      to map a perfect 8x8 chessboard grid without bleeding/stretching.
+#   4. Accumulates and averages marker corner positions across frames for stability.
+#   5. Auto-saves board_cache.json when all 4 are locked.
+# """
+
+# import cv2
+# import numpy as np
+# import redis
+# import json
+# import time
+# import sys
+# import os
+
+# # ── Config ────────────────────────────────────────────────────────────────────
+# REDIS_HOST     = "127.0.0.1"
+# REDIS_PORT     = 6379
+# CACHE_FILE     = "board_cache.json"
+
+# # Marker IDs and their board configurations
+# MARKER_CONFIG = {
+#     12: {"label": "TL", "corner_idx": 0, "color_bgr": (0, 255, 0)},    # Green - Top Left (a8)
+#     13: {"label": "TR", "corner_idx": 1, "color_bgr": (0, 200, 255)},  # Yellow - Top Right (h8)
+#     11: {"label": "BR", "corner_idx": 2, "color_bgr": (255, 100, 0)},  # Orange - Bottom Right (h1)
+#     10: {"label": "BL", "corner_idx": 3, "color_bgr": (255, 0, 200)},  # Pink - Bottom Left (a1)
+# }
+
+# MIN_SEEN_TO_LOCK = 3     # How many times a marker must be seen to lock
+# WARP_SIZE        = 640   # Output square board image size (pixels)
+# DISPLAY_WIDTH    = 900   # Total display window width
+# DISPLAY_HEIGHT   = 600   # Total display window height
+
+# ARUCO_DICTS_TO_TRY = [
+#     cv2.aruco.DICT_4X4_50,
+#     cv2.aruco.DICT_4X4_100,
+#     cv2.aruco.DICT_4X4_250,
+#     cv2.aruco.DICT_5X5_100,
+#     cv2.aruco.DICT_6X6_250,
+# ]
+
+# def make_detector(aruco_dict_id, adaptive=False):
+#     aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_id)
+#     params = cv2.aruco.DetectorParameters()
+#     if adaptive:
+#         params.adaptiveThreshWinSizeMin    = 3
+#         params.adaptiveThreshWinSizeMax    = 53
+#         params.adaptiveThreshWinSizeStep   = 4
+#         params.adaptiveThreshConstant      = 7
+#         params.minMarkerPerimeterRate      = 0.02
+#         params.maxMarkerPerimeterRate      = 4.0
+#         params.polygonalApproxAccuracyRate = 0.05
+#         params.cornerRefinementMethod      = cv2.aruco.CORNER_REFINE_SUBPIX
+#         params.cornerRefinementMaxIterations = 50
+#         params.cornerRefinementMinAccuracy  = 0.01
+#         params.minDistanceToBorder          = 1
+#         params.errorCorrectionRate          = 0.9
+#     return cv2.aruco.ArucoDetector(aruco_dict, params)
+
+# DETECTORS = []
+# for d_id in ARUCO_DICTS_TO_TRY:
+#     DETECTORS.append(make_detector(d_id, adaptive=False))
+#     DETECTORS.append(make_detector(d_id, adaptive=True))
+
+# def preprocess_for_aruco(frame):
+#     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#     candidates = [gray]
+    
+#     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+#     candidates.append(clahe.apply(gray))
+
+#     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+#     sharpened = cv2.filter2D(gray, -1, kernel)
+#     candidates.append(sharpened)
+
+#     p2, p98 = np.percentile(gray, (2, 98))
+#     stretched = np.clip((gray.astype(float) - p2) / (p98 - p2 + 1e-6) * 255, 0, 255).astype(np.uint8)
+#     candidates.append(stretched)
+
+#     bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+#     candidates.append(bilateral)
+
+#     return candidates
+
+# def detect_aruco_markers(frame):
+#     """ Tries combinations and returns dict of {id: 4_corners_array} """
+#     best_corners_raw = {}
+#     candidates = preprocess_for_aruco(frame)
+#     target_ids = set(MARKER_CONFIG.keys())
+
+#     for img_candidate in candidates:
+#         for detector in DETECTORS:
+#             corners, ids, _ = detector.detectMarkers(img_candidate)
+#             if ids is None:
+#                 continue
+
+#             corners_raw = {}
+#             for i, marker_id in enumerate(ids.flatten()):
+#                 if marker_id in target_ids:
+#                     pts = corners[i][0]  # shape (4, 2)
+#                     corners_raw[int(marker_id)] = pts
+
+#             if len(corners_raw) > len(best_corners_raw):
+#                 best_corners_raw = corners_raw
+
+#             if len(best_corners_raw) == 4:
+#                 return best_corners_raw
+
+#     return best_corners_raw
+
+# def compute_warp_matrix(marker_corners_dict):
+#     """
+#     Extracts the targeted internal corner indexing from OpenCV's ArUco format:
+#     Index Layout: 0=TopLeft, 1=TopRight, 2=BottomRight, 3=BottomLeft
+#     """
+#     W = WARP_SIZE
+    
+#     # Extract the precise inner corner pointing directly toward the chess grid lines
+#     tl_inner = marker_corners_dict[12][2]  # ID 12 (TL) -> Bottom-Right corner
+#     tr_inner = marker_corners_dict[13][3]  # ID 13 (TR) -> Bottom-Left corner
+#     br_inner = marker_corners_dict[11][0]  # ID 11 (BR) -> Top-Left corner
+#     bl_inner = marker_corners_dict[10][1]  # ID 10 (BL) -> Top-Right corner
+
+#     src_pts = np.float32([tl_inner, tr_inner, br_inner, bl_inner])
+    
+#     dst_pts = np.float32([
+#         [0,   0  ],  # Matches directly to the edge of the warp window
+#         [W-1, 0  ],  
+#         [W-1, W-1],  
+#         [0,   W-1],  
+#     ])
+    
+#     M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+#     return M, src_pts, dst_pts
+
+# # ── Visualization ─────────────────────────────────────────────────────────────
+# FONT       = cv2.FONT_HERSHEY_SIMPLEX
+# FONT_BOLD  = cv2.FONT_HERSHEY_DUPLEX
+# STATUS_W   = 280
+
+# def draw_marker_on_frame(frame, marker_id, corners_pts, locked=False):
+#     cfg   = MARKER_CONFIG[marker_id]
+#     color = cfg["color_bgr"]
+#     label = f"ID{marker_id} ({cfg['label']})"
+#     pts   = corners_pts.astype(int)
+
+#     overlay = frame.copy()
+#     cv2.fillPoly(overlay, [pts], color)
+#     cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+
+#     border = 3 if locked else 2
+#     cv2.polylines(frame, [pts], True, color, border)
+
+#     for pt in pts:
+#         cv2.circle(frame, tuple(pt), 4, color, -1)
+
+#     top_y  = int(pts[:, 1].min())
+#     top_x  = int(pts[:, 0].mean())
+
+#     (tw, th), _ = cv2.getTextSize(label, FONT_BOLD, 0.55, 1)
+#     label_x = max(2, min(frame.shape[1] - tw - 2, top_x - tw // 2))
+#     label_y = max(th + 4, top_y - 10)
+
+#     bg_color = (0, 120, 0) if locked else (0, 0, 0)
+#     cv2.rectangle(frame, (label_x - 4, label_y - th - 4), (label_x + tw + 4, label_y + 4), bg_color, -1)
+#     cv2.putText(frame, label, (label_x, label_y), FONT_BOLD, 0.55, color, 1, cv2.LINE_AA)
+#     if locked:
+#         cv2.putText(frame, "✓", (label_x + tw + 6, label_y), FONT_BOLD, 0.45, (0, 255, 100), 1)
+
+# def draw_board_outline(frame, marker_corners):
+#     # Quick visual link using the inner corners determined by our map setup
+#     order = [12, 13, 11, 10]
+#     pts_list = []
+#     for mid in order:
+#         if mid in marker_corners:
+#             if mid == 12: pts_list.append(marker_corners[12][2])
+#             elif mid == 13: pts_list.append(marker_corners[13][3])
+#             elif mid == 11: pts_list.append(marker_corners[11][0])
+#             elif mid == 10: pts_list.append(marker_corners[10][1])
+            
+#     if len(pts_list) == 4:
+#         pts_arr = np.array(pts_list, dtype=np.int32)
+#         cv2.polylines(frame, [pts_arr], True, (0, 255, 255), 2, cv2.LINE_AA)
+
+# def build_status_panel(detected_ids, locked_ids, seen_counts, frame_count, fps):
+#     panel = np.zeros((DISPLAY_HEIGHT, STATUS_W, 3), dtype=np.uint8)
+#     panel[:] = (18, 18, 28)
+
+#     y = 20
+#     cv2.putText(panel, "CHESS ROBOT", (10, y), FONT_BOLD, 0.7, (200, 200, 255), 1)
+#     y += 22
+#     cv2.putText(panel, "CALIBRATION", (10, y), FONT_BOLD, 0.7, (200, 200, 255), 1)
+#     y += 30
+#     cv2.line(panel, (10, y), (STATUS_W - 10, y), (80, 80, 120), 1)
+#     y += 18
+
+#     cv2.putText(panel, "ARUCO MARKERS", (10, y), FONT, 0.45, (150, 150, 180), 1)
+#     y += 20
+
+#     for mid, cfg in MARKER_CONFIG.items():
+#         color   = cfg["color_bgr"]
+#         locked  = mid in locked_ids
+#         seen    = mid in detected_ids
+#         count   = seen_counts.get(mid, 0)
+
+#         if locked:
+#             status    = f"LOCKED  ({count}x)"
+#             dot_color = color
+#             txt_color = (80, 230, 80)
+#         elif seen:
+#             status    = f"seen {count}/{MIN_SEEN_TO_LOCK}"
+#             dot_color = tuple(int(c * 0.6) for c in color)
+#             txt_color = (200, 180, 50)
+#         else:
+#             status    = "SEARCHING..."
+#             dot_color = (60, 60, 60)
+#             txt_color = (160, 80, 80)
+
+#         cv2.circle(panel, (22, y - 4), 7, dot_color, -1)
+#         if locked:
+#             cv2.circle(panel, (22, y - 4), 7, (255, 255, 255), 1)
+
+#         lbl = f"ID {mid:2d} ({cfg['label']})"
+#         cv2.putText(panel, lbl,    (38, y),      FONT, 0.5,  (220, 220, 220), 1)
+#         cv2.putText(panel, status, (38, y + 16), FONT, 0.38, txt_color, 1)
+#         y += 44
+
+#     y += 4
+#     cv2.line(panel, (10, y), (STATUS_W - 10, y), (80, 80, 120), 1)
+#     y += 18
+
+#     n_locked = len(locked_ids)
+#     prog_col = (80, 230, 80) if n_locked == 4 else (200, 140, 0) if n_locked >= 2 else (180, 80, 80)
+#     cv2.putText(panel, f"Locked: {n_locked}/4", (10, y), FONT_BOLD, 0.65, prog_col, 1)
+#     y += 26
+
+#     bar_w = STATUS_W - 30
+#     cv2.rectangle(panel, (10, y), (10 + bar_w, y + 14), (40, 40, 60), -1)
+#     filled = int(bar_w * n_locked / 4)
+#     cv2.rectangle(panel, (10, y), (10 + filled, y + 14), prog_col, -1)
+#     y += 24
+
+#     if n_locked < 4:
+#         cv2.putText(panel, "Each marker locks", (10, y), FONT, 0.38, (150, 150, 180), 1)
+#         y += 15
+#         cv2.putText(panel, "independently!", (10, y), FONT, 0.38, (150, 150, 180), 1)
+#         y += 22
+#     else:
+#         cv2.putText(panel, "ALL LOCKED — saving...", (10, y), FONT, 0.42, (80, 230, 80), 1)
+#         y += 22
+
+#     cv2.line(panel, (10, y), (STATUS_W - 10, y), (80, 80, 120), 1)
+#     y += 15
+
+#     cv2.putText(panel, f"Frame: {frame_count}", (10, y), FONT, 0.42, (130, 130, 160), 1)
+#     y += 16
+#     cv2.text = cv2.putText(panel, f"FPS:   {fps:.1f}",    (10, y), FONT, 0.42, (130, 130, 160), 1)
+#     y += 26
+
+#     return panel
+
+# def build_display(frame, corners_raw, locked_corners, locked_ids, seen_counts, frame_count, fps, warp_preview=None):
+#     annotated = frame.copy()
+#     h, w = annotated.shape[:2]
+
+#     display_corners = {**corners_raw, **locked_corners}
+#     if len(display_corners) >= 2:
+#         draw_board_outline(annotated, display_corners)
+
+#     for mid, corners in display_corners.items():
+#         is_locked = mid in locked_ids
+#         draw_marker_on_frame(annotated, mid, corners, locked=is_locked)
+
+#     cv2.rectangle(annotated, (0, 0), (w, 32), (0, 0, 0), -1)
+#     hdr_txt = f"ArUco Calibration | {len(locked_ids)}/4 locked" if len(locked_ids) < 4 else "ArUco Calibration | 4/4 LOCKED — saving..."
+#     cv2.putText(annotated, hdr_txt, (8, 22), FONT, 0.58, (0, 180, 220), 1, cv2.LINE_AA)
+
+#     scale       = DISPLAY_HEIGHT / h
+#     new_w       = int(w * scale)
+#     annotated_r = cv2.resize(annotated, (new_w, DISPLAY_HEIGHT))
+
+#     panel = build_status_panel(set(corners_raw.keys()), locked_ids, seen_counts, frame_count, fps)
+
+#     if warp_preview is not None:
+#         pw = STATUS_W - 20
+#         py_start = DISPLAY_HEIGHT - pw - 70
+#         if py_start > 0:
+#             warp_small = cv2.resize(warp_preview, (pw, pw))
+#             panel[py_start:py_start + pw, 10:10 + pw] = warp_small
+#             cv2.rectangle(panel, (10, py_start), (10 + pw, py_start + pw), (0, 255, 255), 1)
+#             cv2.putText(panel, "Warp Preview", (10, py_start - 6), FONT, 0.38, (0, 220, 220), 1)
+
+#     return np.hstack([annotated_r, panel])
+
+# # ── Cache I/O ─────────────────────────────────────────────────────────────────
+# def save_cache(marker_corners, warp_matrix, source_size=None):
+#     """Saves the calculated corners and matrix to JSON."""
+#     data = {
+#         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+#         "marker_corners": {
+#             str(mid): [[float(pt[0]), float(pt[1])] for pt in corners]
+#             for mid, corners in marker_corners.items()
+#         },
+#         "warp_matrix": warp_matrix.tolist(),
+#         "warp_size": WARP_SIZE,
+#         "source_size": source_size,
+#         "notes": "Generated with inner-corner targeting logic.",
+#     }
+#     with open(CACHE_FILE, "w") as f:
+#         json.dump(data, f, indent=2)
+#     print(f"\n✅ CACHE SAVED → {os.path.abspath(CACHE_FILE)}")
+
+# def load_cache():
+#     if not os.path.exists(CACHE_FILE): return None
+#     try:
+#         with open(CACHE_FILE) as f: return json.load(f)
+#     except: return None
+
+# def connect_redis():
+#     r_bin = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+#     r_str = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+#     r_bin.ping()
+#     return r_bin, r_str
+
+# def read_frame_from_redis(r_bin, last_frame_id, r_str):
+#     try:
+#         new_id = r_str.get("latest_frame_id")
+#         if new_id is None or new_id == last_frame_id:
+#             return None, last_frame_id
+#         raw = r_bin.get("latest_frame")
+#         if raw is None:
+#             return None, last_frame_id
+#         img_np = np.frombuffer(raw, dtype=np.uint8)
+#         frame  = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+#         return frame, new_id
+#     except Exception as e:
+#         print(f"⚠️ Redis read error: {e}")
+#         return None, last_frame_id
+
+# # ── Main Loop ─────────────────────────────────────────────────────────────────
+# def main():
+#     print("=" * 60)
+#     print(" ♟ Chess Robot — ArUco Board Calibration (Inner-Corner Mode)")
+#     print("=" * 60)
+
+#     try:
+#         r_bin, r_str = connect_redis()
+#         print("✅ Redis OK\n")
+#     except Exception as e:
+#         print(f"❌ Redis connection failed: {e}")
+#         sys.exit(1)
+
+#     existing = load_cache()
+#     if existing:
+#         ans = input("📂 Existing cache found. Use it and skip calibration? [Y/n]: ").strip().lower()
+#         if ans != "n":
+#             return
+
+#     seen_counts    = {}   # mid -> frame count
+#     sum_corners    = {}   # mid -> accumulated 4-corner matrices
+#     locked_ids     = set()
+#     locked_corners = {}   # mid -> averaged 4 corners
+
+#     frame_count = 0
+#     last_frame_id = None
+#     fps = 0.0
+#     t_fps = time.time()
+#     fps_frames = 0
+#     last_warp_preview = None
+#     calibration_done = False
+
+#     cv2.namedWindow("Chess Robot — Calibration", cv2.WINDOW_NORMAL)
+#     cv2.resizeWindow("Chess Robot — Calibration", DISPLAY_WIDTH, DISPLAY_HEIGHT)
+
+#     while not calibration_done:
+#         frame, last_frame_id = read_frame_from_redis(r_bin, last_frame_id, r_str)
+
+#         if frame is None:
+#             if cv2.waitKey(50) & 0xFF == ord('q'): break
+#             continue
+
+#         frame_count += 1
+#         fps_frames  += 1
+#         now = time.time()
+#         if now - t_fps >= 1.0:
+#             fps = fps_frames / (now - t_fps)
+#             fps_frames = 0
+#             t_fps = now
+
+#         # Detect corners in the frame
+#         corners_raw = detect_aruco_markers(frame)
+
+#         for mid, pts in corners_raw.items():
+#             if mid in locked_ids: 
+#                 continue
+
+#             seen_counts[mid] = seen_counts.get(mid, 0) + 1
+
+#             if mid not in sum_corners:
+#                 sum_corners[mid] = pts.copy()
+#             else:
+#                 sum_corners[mid] = sum_corners[mid] + pts
+
+#             if seen_counts[mid] >= MIN_SEEN_TO_LOCK:
+#                 locked_ids.add(mid)
+#                 locked_corners[mid] = sum_corners[mid] / seen_counts[mid]
+#                 print(f"  🔒 ID{mid} LOCKED (Inner corner stabilization active)")
+
+#         # Warp Preview calculations
+#         warp_preview = last_warp_preview
+#         all_corners_for_warp = {**locked_corners, **corners_raw}
+
+#         if len(all_corners_for_warp) == 4:
+#             try:
+#                 M, _, _ = compute_warp_matrix(all_corners_for_warp)
+#                 warp_preview = cv2.warpPerspective(frame, M, (WARP_SIZE, WARP_SIZE))
+#                 last_warp_preview = warp_preview
+#             except:
+#                 pass
+
+#         display = build_display(frame, corners_raw, locked_corners, locked_ids, seen_counts, frame_count, fps, warp_preview)
+#         cv2.imshow("Chess Robot — Calibration", display)
+
+#         key = cv2.waitKey(1) & 0xFF
+#         if key == ord('q'): 
+#             break
+#         elif key == ord('r'):
+#             seen_counts, sum_corners, locked_ids, locked_corners = {}, {}, set(), {}
+#             last_warp_preview = None
+#             if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+#             print("🔄 Reset complete.")
+#         elif (key == ord('s') or len(locked_ids) == 4):
+#             if len(locked_ids) == 4:
+#                 M, _, _ = compute_warp_matrix(locked_corners)
+#                 h, w = frame.shape[:2]
+#                 save_cache(locked_corners, M, source_size=[w, h])
+#                 calibration_done = True
+#                 break
+
+#     cv2.destroyAllWindows()
+
+# if __name__ == "__main__":
+#     main()
